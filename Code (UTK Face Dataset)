@@ -1,1 +1,614 @@
+from google.colab import files
+uploaded = files.upload()
 
+!pip install -q Kaggle
+
+!mkdir -p ~/.kaggle
+!cp </content/drive/My\ Drive/kaggle.json> ~/.kaggle/
+!chmod 600 ~/.kaggle/kaggle.json
+!kaggle datasets download -d jangedoo/utkface-new
+!unzip utkface-new.zip -d utkface
+
+!pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu117
+!pip install Pillow
+!pip install pandas
+!pip install seaborn
+!pip install scikit-learn
+!pip install opencv-python matplotlib
+
+import os
+from PIL import Image, ImageOps
+import numpy as np
+import pandas as pd
+import seaborn as sns
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import torch.optim as optim
+from torchvision import transforms, datasets, models
+from torch.utils.data import Dataset, DataLoader, random_split
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import mean_squared_error, mean_absolute_error
+import math
+import torchvision.models as models
+import matplotlib.pyplot as plt
+import cv2
+
+
+# Load images and labels with error handling
+images = []
+ages = []
+
+for i in os.listdir('/content/utkface/crop_part1/')[0:8000]:
+    try:
+        split = i.split('_')
+        ages.append(int(split[0]))
+        images.append(Image.open('/content/utkface/crop_part1/' + i))
+    except (IOError, ValueError) as e:
+        print(f"Error loading image {i}: {e}")
+        continue
+
+images = pd.Series(list(images), name='Images')
+ages = pd.Series(list(ages), name='Ages')
+
+df = pd.concat([images, ages], axis=1)
+
+# Display sample images and labels
+display(df['Images'][0])
+print(df['Ages'][0])
+
+display(df['Images'][1])
+print(df['Ages'][1])
+
+# Plot distributions
+sns.set_theme()
+sns.histplot(df['Ages'], kde=True, bins=30)
+
+# Undersample ages <= 4
+under4s = df[df['Ages'] <= 4]
+under4s = under4s.sample(frac=0.3)
+
+df = df[df['Ages'] > 4]
+df = pd.concat([df, under4s], ignore_index=True)
+
+sns.histplot(df['Ages'], kde=True, bins=30)
+
+# Filter ages < 80
+df = df[df['Ages'] < 80]
+sns.histplot(df['Ages'], kde=True, bins=20)
+
+# Custom Dataset Class
+class FaceDataset(Dataset):
+    def __init__(self, images, labels, transform=None):
+        self.images = images
+        self.labels = labels
+        self.transform = transform
+
+    def __len__(self):
+        return len(self.images)
+
+    def __getitem__(self, idx):
+        image = self.images[idx]
+        label = self.labels[idx]
+        image = Image.fromarray(image)
+        if self.transform:
+            image = self.transform(image)
+        return image, label
+
+class GradCAM:
+    def __init__(self, model, target_layer):
+        self.model = model
+        self.target_layer = target_layer
+        self.gradients = None
+
+        # Hook the target layer
+        self.hook_layers()
+
+    def hook_layers(self):
+        def forward_hook(module, input, output):
+            self.activations = output
+        def backward_hook(module, grad_input, grad_output):
+            self.gradients = grad_output[0]
+
+        self.target_layer.register_forward_hook(forward_hook)
+        self.target_layer.register_backward_hook(backward_hook)
+
+    def generate_cam(self, input_tensor, target_class):
+        # Forward pass
+        output = self.model(input_tensor)
+
+        # Zero the gradients
+        self.model.zero_grad()
+
+        # Backpropagate for the target class
+        one_hot_output = torch.zeros_like(output)
+        one_hot_output[0][target_class] = 1
+        output.backward(gradient=one_hot_output)
+
+        # Get the gradients and activations
+        gradients = self.gradients
+        activations = self.activations
+
+        # Global average pool the gradients
+        pooled_gradients = torch.mean(gradients, dim=[0, 2, 3])
+
+        # Weight the activations by the gradients
+        for i in range(activations.shape[1]):
+            activations[:, i, :, :] *= pooled_gradients[i]
+
+        # Create the heatmap
+        heatmap = torch.mean(activations, dim=1).squeeze()
+        heatmap = F.relu(heatmap)
+        heatmap /= torch.max(heatmap)
+
+        return heatmap.detach().cpu().numpy()
+
+
+# Location-Based Attention Module
+class LocationBasedAttentionModule(nn.Module):
+    def __init__(self, in_channels, reduction_ratio=16):
+        super(LocationBasedAttentionModule, self).__init__()
+        self.avg_pool = nn.AdaptiveAvgPool2d(1)
+        self.max_pool = nn.AdaptiveMaxPool2d(1)
+        self.fc1 = nn.Linear(in_channels, in_channels // reduction_ratio)
+        self.relu = nn.ReLU()
+        self.fc2 = nn.Linear(in_channels // reduction_ratio, in_channels)
+        self.sigmoid = nn.Sigmoid()
+
+        # Convolutional layer for spatial attention
+        self.conv = nn.Conv2d(2, 1, kernel_size=7, padding=3, bias=False)
+
+    def forward(self, x):
+        # Channel attention
+        avg_out = self.avg_pool(x).view(x.size(0), -1)
+        max_out = self.max_pool(x).view(x.size(0), -1)
+        channel_attention = self.fc1(avg_out) + self.fc1(max_out)
+        channel_attention = self.relu(channel_attention)
+        channel_attention = self.fc2(channel_attention)
+        channel_attention = self.sigmoid(channel_attention).view(x.size(0), x.size(1), 1, 1)
+
+        # Spatial attention
+        avg_out = torch.mean(x, dim=1, keepdim=True)
+        max_out, _ = torch.max(x, dim=1, keepdim=True)
+        spatial_attention = torch.cat([avg_out, max_out], dim=1)
+        spatial_attention = self.conv(spatial_attention)
+        spatial_attention = self.sigmoid(spatial_attention)
+
+        # Combined attention
+        attention = channel_attention * spatial_attention
+        return x * attention
+
+# Custom ResNet-like Model
+class BasicBlock(nn.Module):
+    expansion = 1
+
+    def __init__(self, in_channels, out_channels, stride=1, downsample=None):
+        super(BasicBlock, self).__init__()
+        self.conv1 = nn.Conv2d(in_channels, out_channels, kernel_size=3, stride=stride, padding=1, bias=False)
+        self.bn1 = nn.BatchNorm2d(out_channels)
+        self.relu = nn.ReLU(inplace=True)
+        self.conv2 = nn.Conv2d(out_channels, out_channels, kernel_size=3, stride=1, padding=1, bias=False)
+        self.bn2 = nn.BatchNorm2d(out_channels)
+        self.downsample = downsample
+
+    def forward(self, x):
+        identity = x
+        out = self.conv1(x)
+        out = self.bn1(out)
+        out = self.relu(out)
+        out = self.conv2(out)
+        out = self.bn2(out)
+        if self.downsample is not None:
+            identity = self.downsample(x)
+        out += identity
+        out = self.relu(out)
+        return out
+
+class AgeModel(nn.Module):
+    def __init__(self, block, layers, num_classes=1):
+        super(AgeModel, self).__init__()
+        self.in_channels = 64
+        self.conv1 = nn.Conv2d(3, 64, kernel_size=7, stride=2, padding=3, bias=False)
+        self.bn1 = nn.BatchNorm2d(64)
+        self.relu = nn.ReLU(inplace=True)
+        self.maxpool = nn.MaxPool2d(kernel_size=3, stride=2, padding=1)
+        self.layer1 = self._make_layer(block, 64, layers[0])
+        self.layer2 = self._make_layer(block, 128, layers[1], stride=2)
+        self.layer3 = self._make_layer(block, 256, layers[2], stride=2)
+        self.layer4 = self._make_layer(block, 512, layers[3], stride=2)
+        self.avgpool = nn.AdaptiveAvgPool2d((1, 1))
+        self.dropout = nn.Dropout(0.5)
+        self.fc = nn.Linear(512 * block.expansion, num_classes)
+
+    def _make_layer(self, block, out_channels, blocks, stride=1):
+        downsample = None
+        if stride != 1 or self.in_channels != out_channels * block.expansion:
+            downsample = nn.Sequential(
+                nn.Conv2d(self.in_channels, out_channels * block.expansion, kernel_size=1, stride=stride, bias=False),
+                nn.BatchNorm2d(out_channels * block.expansion),
+            )
+        layers = []
+        layers.append(block(self.in_channels, out_channels, stride, downsample))
+        self.in_channels = out_channels * block.expansion
+        for _ in range(1, blocks):
+            layers.append(block(self.in_channels, out_channels))
+        return nn.Sequential(*layers)
+
+    def forward(self, x):
+        x = self.conv1(x)
+        x = self.bn1(x)
+        x = self.relu(x)
+        x = self.maxpool(x)
+        x = self.layer1(x)
+        x = self.layer2(x)
+        x = self.layer3(x)
+        x = self.layer4(x)
+        x = self.avgpool(x)
+        x = torch.flatten(x, 1)
+        x = self.dropout(x)
+        x = self.fc(x)
+        return x
+
+def agemodel():
+    model = AgeModel(BasicBlock, [2, 2, 2, 2])
+    model.attention = LocationBasedAttentionModule(512)  # Add attention to the model
+    return model
+
+class CustomResNet50(nn.Module):
+    def __init__(self):
+        super(CustomResNet50, self).__init__()
+        # Load the pre-trained ResNet-50 model
+        self.resnet50 = models.resnet50(weights=models.ResNet50_Weights.DEFAULT)
+
+        # Modify the fully connected layer to output 1 value (age prediction)
+        self.resnet50.fc = nn.Linear(self.resnet50.fc.in_features, 1)
+
+        # Add the Location-Based Attention Module after the last ResNet block
+        self.attention = LocationBasedAttentionModule(2048)  # The output channels from ResNet-50's last block is 2048
+
+        # Add a dropout layer
+        self.dropout = nn.Dropout(0.5)  # 50% dropout rate
+
+    def forward(self, x):
+        # Pass through ResNet-50 layers
+        x = self.resnet50.conv1(x)
+        x = self.resnet50.bn1(x)
+        x = self.resnet50.relu(x)
+        x = self.resnet50.maxpool(x)
+
+        x = self.resnet50.layer1(x)
+        x = self.resnet50.layer2(x)
+        x = self.resnet50.layer3(x)
+        x = self.resnet50.layer4(x)
+
+        # Apply attention module
+        x = self.attention(x)
+
+        x = self.resnet50.avgpool(x)
+        x = torch.flatten(x, 1)
+
+        # Apply dropout
+        x = self.dropout(x)
+
+        x = self.resnet50.fc(x)
+        return x
+
+class CustomEfficientNetB0(nn.Module):
+    def __init__(self):
+        super(CustomEfficientNetB0, self).__init__()
+        # Load the pre-trained EfficientNet-B0 model
+        self.efficientnet = models.efficientnet_b0(weights=models.EfficientNet_B0_Weights.DEFAULT)
+
+        # Modify the classifier layer to output 1 value (age prediction)
+        self.efficientnet.classifier[1] = nn.Linear(self.efficientnet.classifier[1].in_features, 1)
+
+        # Add the Location-Based Attention Module after the last EfficientNet block
+        self.attention = LocationBasedAttentionModule(1280)  # The output channels from EfficientNet-B0's last block is 1280
+
+        # Add a dropout layer
+        self.dropout = nn.Dropout(0.5)  # 50% dropout rate
+
+    def forward(self, x):
+        # Pass through EfficientNet-B0 layers
+        x = self.efficientnet.features(x)
+
+        # Apply attention module
+        x = self.attention(x)
+
+        x = self.efficientnet.avgpool(x)
+        x = torch.flatten(x, 1)
+
+        # Apply dropout
+        x = self.dropout(x)
+
+        x = self.efficientnet.classifier(x)
+        return x
+
+# Ensemble Model Class
+class EnsembleModel(nn.Module):
+    def __init__(self, models):
+        super(EnsembleModel, self).__init__()
+        self.models = nn.ModuleList(models)
+
+    def forward(self, x):
+        predictions = [model(x) for model in self.models]
+        avg_prediction = torch.mean(torch.stack(predictions), dim=0)
+        return avg_prediction
+
+# Create Models for Ensembling
+def create_models():
+    custom_model = agemodel()
+    custom_resnet50 = CustomResNet50()
+    custom_efficientnet = CustomEfficientNetB0()
+    return [custom_model, custom_resnet50, custom_efficientnet]
+
+# Data Preparation
+def prepare_data(df):
+    x = []
+    y = []
+    for i in range(len(df)):
+        img = df['Images'].iloc[i].resize((224, 224), Image.LANCZOS)
+        x.append(np.array(img))
+        age = int(df['Ages'].iloc[i])
+        y.append(age)
+    x = np.array(x)
+    y = df['Ages'].values
+    x_train, x_test, y_train, y_test = train_test_split(x, y, test_size=0.2, stratify=y)
+    return x_train, x_test, y_train, y_test
+
+# Data Augmentation
+transform = transforms.Compose([
+    transforms.RandomHorizontalFlip(),
+    transforms.RandomRotation(10),
+    transforms.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2, hue=0.2),
+    transforms.RandomResizedCrop(224, scale=(0.8, 1.0)),
+    transforms.RandomGrayscale(p=0.1),
+    transforms.GaussianBlur(kernel_size=5, sigma=(0.1, 2.0)),
+    transforms.ToTensor(),
+    transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+])
+
+# Training and Evaluation Functions
+def train(model, dataloader, criterion, optimizer, device, accumulation_steps=1):
+    model.train()
+    running_loss = 0.0
+    optimizer.zero_grad()
+    for i, (images, labels) in enumerate(dataloader):
+        images, labels = images.to(device), labels.to(device).float().unsqueeze(1)
+        outputs = model(images)
+        loss = criterion(outputs, labels)
+        loss = loss / accumulation_steps
+        loss.backward()
+        if (i + 1) % accumulation_steps == 0:
+            optimizer.step()
+            optimizer.zero_grad()
+        running_loss += loss.item() * images.size(0) * accumulation_steps
+    epoch_loss = running_loss / len(dataloader.dataset)
+    return epoch_loss
+
+def evaluate(model, dataloader, criterion, device, return_predictions=False):
+    model.eval()
+    running_loss = 0.0
+    all_predictions = []
+    all_labels = []
+    with torch.no_grad():
+        for images, labels in dataloader:
+            images, labels = images.to(device), labels.to(device).float().unsqueeze(1)
+            outputs = model(images)
+            loss = criterion(outputs, labels)
+            running_loss += loss.item() * images.size(0)
+            all_predictions.extend(outputs.cpu().numpy().flatten())
+            all_labels.extend(labels.cpu().numpy().flatten())
+    epoch_loss = running_loss / len(dataloader.dataset)
+    rmse = math.sqrt(mean_squared_error(all_labels, all_predictions))
+    mae = mean_absolute_error(all_labels, all_predictions)
+    cs = sum(abs(pred - true) <= 5 for pred, true in zip(all_predictions, all_labels)) / len(all_labels)
+    if return_predictions:
+        return epoch_loss, rmse, mae, cs, all_predictions, all_labels  # Return predictions and actual values
+    else:
+        return epoch_loss, rmse, mae, cs
+
+# Main Training Loop for Ensemble
+def train_ensemble(models, train_loader, test_loader, device, num_epochs=50, accumulation_steps=1):
+    ensemble_model = EnsembleModel(models).to(device)
+    criterion = nn.MSELoss()
+    optimizer = optim.Adam(ensemble_model.parameters(), lr=0.0001)
+    scheduler = optim.lr_scheduler.CosineAnnealingWarmRestarts(optimizer, T_0=10, T_mult=1)
+    patience = 10
+    best_val_loss = float('inf')
+    patience_counter = 0
+    train_losses = []
+    val_losses = []
+    val_rmse_scores = []
+    val_mae_scores = []
+    val_cs_scores = []
+
+    for epoch in range(num_epochs):
+        train_loss = train(ensemble_model, train_loader, criterion, optimizer, device, accumulation_steps)
+        val_loss, val_rmse, val_mae, val_cs = evaluate(ensemble_model, test_loader, criterion, device)
+
+        # Store metrics for plotting
+        train_losses.append(train_loss)
+        val_losses.append(val_loss)
+        val_rmse_scores.append(val_rmse)
+        val_mae_scores.append(val_mae)
+        val_cs_scores.append(val_cs)
+
+        scheduler.step()
+
+        print(f"Epoch {epoch + 1}/{num_epochs}, Train Loss: {train_loss:.4f}, Val Loss: {val_loss:.4f}, Val RMSE: {val_rmse:.4f}, Val MAE: {val_mae:.4f}, Val CS (5 years): {val_cs:.4f}")
+
+        if val_loss < best_val_loss:
+            best_val_loss = val_loss
+            patience_counter = 0
+            torch.save(ensemble_model.state_dict(), "best_ensemble_model.pth")
+        else:
+            patience_counter += 1
+
+        if patience_counter >= patience:
+            print("Early stopping!")
+            break
+
+    # Plot the graphs after training
+    plot_metrics(train_losses, val_losses, val_rmse_scores, val_mae_scores, val_cs_scores)
+
+    # Load the best model for final evaluation
+    ensemble_model.load_state_dict(torch.load("best_ensemble_model.pth"))
+    test_loss, test_rmse, test_mae, test_cs, predictions, actuals = evaluate(ensemble_model, test_loader, criterion, device, return_predictions=True)
+    print(f"Test Loss: {test_loss:.4f}, Test RMSE: {test_rmse:.4f}, Test MAE: {test_mae:.4f}, Test CS (5 years): {test_cs:.4f}")
+
+    # Plot predicted vs actual ages
+    plot_predicted_vs_actual(predictions, actuals)
+
+# Plot Metrics and Predictions
+def plot_metrics(train_losses, val_losses, val_rmse_scores, val_mae_scores, val_cs_scores):
+    epochs = range(1, len(train_losses) + 1)
+    plt.figure(figsize=(10, 6))
+    plt.plot(epochs, train_losses, 'b', label='Training loss')
+    plt.plot(epochs, val_losses, 'r', label='Validation loss')
+    plt.title('Training and Validation Loss')
+    plt.xlabel('Epochs')
+    plt.ylabel('Loss')
+    plt.legend()
+    plt.show()
+    plt.figure(figsize=(10, 6))
+    plt.plot(epochs, val_rmse_scores, 'g', label='Validation RMSE')
+    plt.title('Validation RMSE')
+    plt.xlabel('Epochs')
+    plt.ylabel('RMSE')
+    plt.legend()
+    plt.show()
+    plt.figure(figsize=(10, 6))
+    plt.plot(epochs, val_mae_scores, 'orange', label='Validation MAE')
+    plt.title('Validation MAE')
+    plt.xlabel('Epochs')
+    plt.ylabel('MAE')
+    plt.legend()
+    plt.show()
+    plt.figure(figsize=(10, 6))
+    plt.plot(epochs, val_cs_scores, 'purple', label='Cumulative Score (CS) 5 years')
+    plt.title('Validation Cumulative Score (CS)')
+    plt.xlabel('Epochs')
+    plt.ylabel('Cumulative Score')
+    plt.legend()
+    plt.show()
+
+def plot_predicted_vs_actual(predictions, actuals):
+    plt.figure(figsize=(10, 6))
+    plt.scatter(actuals, predictions, alpha=0.5)
+    plt.plot([min(actuals), max(actuals)], [min(actuals), max(actuals)], 'r')  # Line of perfect predictions
+    plt.xlabel('Actual Age')
+    plt.ylabel('Predicted Age')
+    plt.title('Predicted vs Actual Age')
+    plt.show()
+
+# Apply Grad-CAM to ResNet-50, EfficientNet-B0, and your custom model
+def generate_gradcam_heatmaps(models, image_tensor, target_class, device):
+    heatmaps = []
+
+    # Assuming you're applying Grad-CAM to the last convolutional layers
+    for model in models:
+        if isinstance(model, CustomResNet50):
+            gradcam = GradCAM(model, model.resnet50.layer4[-1])  # Last conv layer of ResNet-50
+        elif isinstance(model, CustomEfficientNetB0):
+            gradcam = GradCAM(model, model.efficientnet.features[-1])  # Last conv layer of EfficientNet-B0
+        else:
+            gradcam = GradCAM(model, model.layer4)  # Last conv layer of your custom model
+
+        heatmap = gradcam.generate_cam(image_tensor, target_class)
+        heatmaps.append(heatmap)
+
+    return heatmaps
+
+def overlay_heatmap(heatmap, image, alpha=0.4):
+    # Resize heatmap to match the size of the image
+    heatmap = cv2.resize(heatmap, (image.size[0], image.size[1]))
+
+    # Convert the heatmap to a 3-channel image
+    heatmap = np.uint8(255 * heatmap)
+    heatmap = cv2.applyColorMap(heatmap, cv2.COLORMAP_JET)
+
+    # Convert PIL image to numpy array
+    image = np.array(image)
+
+    # Overlay the heatmap on the original image
+    overlay = heatmap * alpha + image
+    return np.uint8(overlay)
+
+def display_heatmaps(heatmaps, image):
+    plt.figure(figsize=(15, 10))
+
+    for i, heatmap in enumerate(heatmaps):
+        overlay_image = overlay_heatmap(heatmap, image)
+        plt.subplot(1, len(heatmaps), i + 1)
+        plt.imshow(overlay_image)
+        plt.axis('off')
+
+    plt.show()
+
+def predict_sample_images_with_gradcam(df, models, device):
+    sample_df = df.sample(n=10)  # Choose 10 random images from the dataset
+    for index, row in sample_df.iterrows():
+        # Directly use the PIL Image object from the dataframe
+        image = row['Images']
+        actual_age = row['Ages']
+
+        # Call the Grad-CAM function with the PIL image
+        process_and_predict_with_gradcam(image, models, device)
+
+        # Display the actual age
+        print(f"Actual Age: {actual_age}")
+
+# Example Prediction with Grad-CAM
+def process_and_predict_with_gradcam(image, models, device, target_class=0):
+    # Initialize the ensemble model and load its pre-trained weights
+    ensemble_model = EnsembleModel(models).to(device)
+    ensemble_model.load_state_dict(torch.load("best_ensemble_model.pth"))
+    ensemble_model.eval()
+
+    # Resize the image if needed (PIL Image)
+    image = image.resize((224, 224), Image.LANCZOS)
+
+    # Transform the image to tensor and normalize it for the model
+    transform = transforms.Compose([
+        transforms.ToTensor(),
+        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+    ])
+    image_tensor = transform(image).unsqueeze(0).to(device)
+
+    # Generate Grad-CAM heatmaps for each model in the ensemble
+    heatmaps = generate_gradcam_heatmaps(models, image_tensor, target_class, device)
+
+    # Display the original image first
+    plt.figure(figsize=(15, 10))
+    plt.subplot(1, len(heatmaps) + 1, 1)  # Allocate space for original and heatmaps
+    plt.imshow(image)  # Display the original image
+    plt.title('Original Image')
+    plt.axis('off')
+
+    # Display the generated heatmaps overlaid on the image
+    display_heatmaps(heatmaps, image)
+
+    # Make a prediction using the ensemble model
+    with torch.no_grad():
+        predicted_age = ensemble_model(image_tensor).item()
+
+    # Output the predicted age
+    print(f"Predicted Age: {int(predicted_age)}")
+
+
+# Prepare Data
+# Assuming df is already loaded with images and ages
+x_train, x_test, y_train, y_test = prepare_data(df)
+train_dataset = FaceDataset(x_train, y_train, transform=transform)
+test_dataset = FaceDataset(x_test, y_test, transform=transform)
+train_loader = DataLoader(train_dataset, batch_size=32, shuffle=True)
+test_loader = DataLoader(test_dataset, batch_size=32, shuffle=False)
+
+# Create Models and Train the Ensemble
+model_list = create_models()
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+train_ensemble(model_list, train_loader, test_loader, device)
+
+# Example Prediction on Sample Images with Grad-CAM
+predict_sample_images_with_gradcam(df, model_list, device)
